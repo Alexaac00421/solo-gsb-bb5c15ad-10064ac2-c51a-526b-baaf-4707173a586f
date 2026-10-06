@@ -84,6 +84,12 @@ def _status_badge(status):
     return '<span class="badge open">开放中</span>'
 
 
+def _result_badge(result, label):
+    """交接结论徽章：通过（绿）/ 待核（红）。"""
+    cls = "closed" if result == "pass" else "open"
+    return f'<span class="badge {cls}">{escape(label)}</span>'
+
+
 def error_page(status, message):
     body = f"""
 <div class="card">
@@ -201,7 +207,7 @@ def _risk_groups_card(groups, title, hint=None):
 
 
 def batch_detail(batch, nodes, artifacts, summary, events, gaps, risk_groups, versions,
-                 msg=None, err=None):
+                 handovers, msg=None, err=None):
     node_rows = "".join(
         f"<tr><td>{n['seq']}</td><td>{escape(n['name'])}</td><td>{escape(n['location'])}</td></tr>"
         for n in nodes
@@ -238,6 +244,25 @@ def batch_detail(batch, nodes, artifacts, summary, events, gaps, risk_groups, ve
 
     cur_ver = summary["current_version"]
     event_title = f"当前版本（v{cur_ver}）风险事件" if cur_ver else "风险事件（尚无版本）"
+
+    handover_rows = ""
+    for h in handovers:
+        note = escape(h["note"]) or '<span class="muted">—</span>'
+        evidence = escape(h["evidence_no"]) or '<span class="muted">—</span>'
+        handover_rows += f"""<tr>
+<td>#{h['id']}</td>
+<td>{_fmt_ts(h['handover_ts'])}</td>
+<td>{escape(h['prev_node']['name'])} → {escape(h['next_node']['name'])}</td>
+<td><span class="badge ver">v{h['version']}</span></td>
+<td>{_result_badge(h['result'], h['result_label'])}</td>
+<td>{h['pass_count']} / {h['review_count']}</td>
+<td>处置：{note}<br>证据：{evidence}</td>
+<td>{_fmt_ts(h['created_at'])}</td>
+<td><a href="/batches/{batch['id']}/handovers/{h['id']}">查看快照</a></td>
+</tr>"""
+    if not handover_rows:
+        handover_rows = ('<tr><td colspan="9" class="muted">尚无交接记录，'
+                         '请先在下方预览并确认。</td></tr>')
 
     body = _banner(msg, err) + f"""
 <p><a href="/">← 返回批次列表</a></p>
@@ -312,6 +337,28 @@ def batch_detail(batch, nodes, artifacts, summary, events, gaps, risk_groups, ve
 <div class="card">
   <h2>缺测区间（当前版本）</h2>
   <table><tr><th>文物</th><th>区间</th><th>约定采样间隔</th><th>实际间隔</th></tr>{gap_rows}</table>
+</div>
+
+<div class="card">
+  <h2>运输节点交接（预览 → 确认）</h2>
+  <form method="post" action="/batches/{batch['id']}/handovers/preview">
+    <select name="prev_node_id">{node_options}</select>
+    <select name="next_node_id">{node_options}</select>
+    <input type="datetime-local" name="handover_ts" step="1" required>
+    <button type="submit">预览交接结论</button>
+  </form>
+  <p class="muted">按当前评估版本逐件核验：前节点末条读数、后节点首条读数均须存在且距交接时刻
+  不超过该文物采样间隔，两读数间不得跨缺测区间，交接时刻不得处于未关闭风险事件内；
+  确认时冻结当时版本与逐件结论。无版本、非相邻节点或无效时刻不得生成记录。</p>
+</div>
+
+<div class="card">
+  <h2>交接记录（确认后冻结，后续补录 / 更正 / 关闭事件均不改写）</h2>
+  <table>
+    <tr><th>#</th><th>交接时刻</th><th>前节点 → 后节点</th><th>评估版本</th><th>结论</th>
+        <th>通过 / 待核</th><th>处置说明 / 证据编号</th><th>确认时间</th><th></th></tr>
+    {handover_rows}
+  </table>
 </div>
 
 <div class="card">
@@ -446,3 +493,86 @@ def diff_page(batch, diff):
   {closure_rows}</table>
 </div>"""
     return page("版本差异", body)
+
+
+# ---------------------------------------------------------------- 运输节点交接
+
+def _reading_cell(r):
+    if not r:
+        return '<span class="muted">无</span>'
+    return (f"{_fmt_ts(r['ts'])}<br>温度 {_fmt_num(r['temperature'])} ℃，"
+            f"湿度 {_fmt_num(r['humidity'])} %RH<br>"
+            f"<span class='muted'>距交接 {r['seconds_from_handover']:g} 秒</span>")
+
+
+def _handover_items_table(items):
+    rows = ""
+    for it in items:
+        reasons = "<br>".join(escape(r) for r in it["reasons"])
+        events = "<br>".join(
+            f"{escape(e['metric_label'])} {_fmt_ts(e['start_ts'])} 至 {_fmt_ts(e['end_ts'])}"
+            for e in it["events"]) or '<span class="muted">—</span>'
+        rows += f"""<tr>
+<td>{escape(it['artifact_name'])}</td>
+<td>{_result_badge(it['status'], it['status_label'])}</td>
+<td>{reasons}</td>
+<td>{_reading_cell(it['prev_reading'])}</td>
+<td>{_reading_cell(it['next_reading'])}</td>
+<td>{events}</td>
+</tr>"""
+    if not rows:
+        rows = '<tr><td colspan="6" class="muted">批次内无文物。</td></tr>'
+    return f"""<table>
+    <tr><th>文物</th><th>结论</th><th>原因</th><th>前节点末条读数</th>
+        <th>后节点首条读数</th><th>命中未关闭事件</th></tr>
+    {rows}
+</table>"""
+
+
+def handover_preview_page(batch, preview):
+    body = f"""
+<p><a href="/batches/{batch['id']}">← 返回批次</a></p>
+<div class="card">
+  <h2>交接预览：{escape(preview['prev_node']['name'])} → {escape(preview['next_node']['name'])}</h2>
+  <p>交接时刻：{_fmt_ts(preview['handover_ts'])}　评估版本：<span class="badge ver">v{preview['version']}</span>
+  　整体结论：{_result_badge(preview['result'], preview['result_label'])}
+  　<span class="muted">通过 {preview['pass_count']} / 待核 {preview['review_count']}</span></p>
+  {_handover_items_table(preview['items'])}
+</div>
+<div class="card">
+  <h2>确认交接</h2>
+  <form method="post" action="/batches/{batch['id']}/handovers">
+    <input type="hidden" name="prev_node_id" value="{preview['prev_node']['id']}">
+    <input type="hidden" name="next_node_id" value="{preview['next_node']['id']}">
+    <input type="hidden" name="handover_ts" value="{escape(preview['handover_ts'])}">
+    <input type="hidden" name="version" value="{preview['version']}">
+    <input type="hidden" name="preview_token" value="{escape(preview['preview_token'])}">
+    <input name="note" placeholder="处置说明（有待核项时必填）" size="30">
+    <input name="evidence_no" placeholder="证据编号（有待核项时必填）" size="20">
+    <button type="submit">确认交接并冻结记录</button>
+  </form>
+  <p class="muted">确认时复核当前评估版本与核验结果；若已变化（如补录 / 更正读数、关闭事件）
+  将拒绝并要求重新预览。确认记录冻结当时版本与逐件结论，后续不再改写。</p>
+</div>"""
+    return page("交接预览", body)
+
+
+def handover_record_page(batch, record):
+    note = escape(record["note"]) or "—"
+    evidence = escape(record["evidence_no"]) or "—"
+    body = f"""
+<p><a href="/batches/{batch['id']}">← 返回批次</a></p>
+<div class="card">
+  <h2>交接记录 #{record['id']}：{escape(record['prev_node']['name'])} → {escape(record['next_node']['name'])}</h2>
+  <p>交接时刻：{_fmt_ts(record['handover_ts'])}　评估版本：<span class="badge ver">v{record['version']}</span>
+  　结论：{_result_badge(record['result'], record['result_label'])}
+  　<span class="muted">通过 {record['pass_count']} / 待核 {record['review_count']}</span></p>
+  <p>处置说明：{note}　证据编号：{evidence}<br>
+  <span class="muted">确认时间：{_fmt_ts(record['created_at'])}</span></p>
+  <p class="muted">该记录已冻结：后续补录、更正读数或关闭事件均不改写。</p>
+</div>
+<div class="card">
+  <h2>逐件结论（冻结快照）</h2>
+  {_handover_items_table(record['items'])}
+</div>"""
+    return page(f"交接记录 #{record['id']}", body)

@@ -120,3 +120,33 @@ curl -s -X POST "$BASE/api/batches/1/packages" -H "$JSON" -d '{
 
 echo "== 16. 已成功接收的采集包列表（冲突/校验失败的包不占用编号）=="
 curl -s "$BASE/api/batches/1/packages"
+echo
+
+echo "== 17. 运输节点交接：预览（库房 → 运输车 @ 08:15，按当前评估版本逐件核验）=="
+PREVIEW=$(curl -s -X POST "$BASE/api/batches/1/handovers/preview" -H "$JSON" -d '{
+  "prev_node_id": 1, "next_node_id": 2, "handover_ts": "2026-10-01T08:15:00Z"}')
+echo "$PREVIEW" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("整体结论: %s（通过 %d / 待核 %d，基于 v%d）" % (d["result_label"], d["pass_count"], d["review_count"], d["version"])); [print("  - %s: %s｜%s" % (i["artifact_name"], i["status_label"], "；".join(i["reasons"]))) for i in d["items"]]'
+TOKEN=$(echo "$PREVIEW" | python3 -c 'import json,sys; print(json.load(sys.stdin)["preview_token"])')
+VER=$(echo "$PREVIEW" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
+echo
+
+echo "== 18. 确认交接：有待核项须填写处置说明与证据编号 → 201 冻结记录 =="
+curl -s -X POST "$BASE/api/batches/1/handovers" -H "$JSON" -d "{
+  \"prev_node_id\": 1, \"next_node_id\": 2, \"handover_ts\": \"2026-10-01T08:15:00Z\",
+  \"version\": $VER, \"preview_token\": \"$TOKEN\",
+  \"note\": \"绢画前节点无读数，已现场复核并补采\", \"evidence_no\": \"EV-HO-0001\"}" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("交接记录 #%d 已冻结: %s（v%d）" % (d["id"], d["result_label"], d["version"]))'
+echo
+
+echo "== 19. 补录读数生成新版本后，旧预览确认 → 409 要求重核 =="
+curl -s -X POST "$BASE/api/batches/1/readings" -H "$JSON" \
+  -d '{"note":"补录","readings":[{"artifact_id":2,"node_id":1,"ts":"2026-10-01T08:05:00Z","temperature":20,"humidity":50}]}' > /dev/null
+curl -s -X POST "$BASE/api/batches/1/handovers" -H "$JSON" -d "{
+  \"prev_node_id\": 1, \"next_node_id\": 2, \"handover_ts\": \"2026-10-01T08:15:00Z\",
+  \"version\": $VER, \"preview_token\": \"$TOKEN\",
+  \"note\": \"重试\", \"evidence_no\": \"EV-HO-0002\"}"
+echo
+
+echo "== 20. 交接记录列表与详情（确认后冻结，补录/更正/关闭事件均不改写）=="
+curl -s "$BASE/api/batches/1/handovers"
+curl -s "$BASE/api/batches/1/handovers/1" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("记录 #%d 冻结于 v%d: %s｜说明: %s｜证据: %s" % (d["id"], d["version"], d["result_label"], d["note"], d["evidence_no"]))'

@@ -92,10 +92,25 @@ CREATE TABLE IF NOT EXISTS packages (
     UNIQUE (batch_id, package_id)
 );
 
+CREATE TABLE IF NOT EXISTS handovers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    prev_node_id INTEGER NOT NULL REFERENCES nodes(id),
+    next_node_id INTEGER NOT NULL REFERENCES nodes(id),
+    handover_ts TEXT NOT NULL,
+    version_no INTEGER NOT NULL,
+    result TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    evidence_no TEXT NOT NULL DEFAULT '',
+    items_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_readings_version ON readings(version_id, artifact_id, ts);
 CREATE INDEX IF NOT EXISTS idx_events_version ON events(version_id, status);
 CREATE INDEX IF NOT EXISTS idx_gaps_version ON gaps(version_id);
 CREATE INDEX IF NOT EXISTS idx_packages_batch ON packages(batch_id);
+CREATE INDEX IF NOT EXISTS idx_handovers_batch ON handovers(batch_id);
 """
 
 

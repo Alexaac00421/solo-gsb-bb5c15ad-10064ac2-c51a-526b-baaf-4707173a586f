@@ -57,6 +57,7 @@ def batch_page(ctx):
     return Response(pages.batch_detail(
         batch, service.list_nodes(ctx.conn, bid), service.list_artifacts(ctx.conn, bid),
         summary, events, gaps, risk_groups, service.list_versions(ctx.conn, bid),
+        service.list_handovers(ctx.conn, bid),
         ctx.query.get("msg"), ctx.query.get("err")))
 
 
@@ -128,6 +129,44 @@ def diff_page(ctx):
     batch = service.get_batch(ctx.conn, bid)
     diff = service.version_diff(ctx.conn, bid, from_no, to_no)
     return Response(pages.diff_page(batch, diff))
+
+
+@router.route("POST", "/batches/<bid>/handovers/preview")
+def handover_preview_page(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    batch = service.get_batch(ctx.conn, bid)
+    try:
+        preview = service.preview_handover(
+            ctx.conn, bid, ctx.body.get("prev_node_id"), ctx.body.get("next_node_id"),
+            ctx.body.get("handover_ts"))
+    except service.ValidationError as e:
+        return redirect(f"/batches/{bid}?err=" + quote(e.message))
+    return Response(pages.handover_preview_page(batch, preview))
+
+
+@router.route("POST", "/batches/<bid>/handovers")
+def handover_confirm_page(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    try:
+        record = service.confirm_handover(
+            ctx.conn, bid, ctx.body.get("prev_node_id"), ctx.body.get("next_node_id"),
+            ctx.body.get("handover_ts"), ctx.body.get("version"),
+            ctx.body.get("preview_token"), ctx.body.get("note", ""),
+            ctx.body.get("evidence_no", ""))
+    except (service.ValidationError, service.ConflictError) as e:
+        return redirect(f"/batches/{bid}?err=" + quote(e.message))
+    return redirect(f"/batches/{bid}?msg=" + quote(
+        f"交接记录 #{record['id']} 已确认（结论：{record['result_label']}，"
+        f"基于评估版本 v{record['version']}）"))
+
+
+@router.route("GET", "/batches/<bid>/handovers/<hid>")
+def handover_record_page(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    hid = _int(ctx.params["hid"], "交接记录 id")
+    batch = service.get_batch(ctx.conn, bid)
+    record = service.get_handover(ctx.conn, bid, hid)
+    return Response(pages.handover_record_page(batch, record))
 
 
 # ================================================================ API
@@ -280,6 +319,40 @@ def api_close_event(ctx):
     event = service.close_event(ctx.conn, eid, ctx.body.get("note"),
                                 ctx.body.get("evidence_no"))
     return json_response(event)
+
+
+@router.route("POST", "/api/batches/<bid>/handovers/preview")
+def api_preview_handover(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    body = ctx.body if isinstance(ctx.body, dict) else {}
+    preview = service.preview_handover(
+        ctx.conn, bid, body.get("prev_node_id"), body.get("next_node_id"),
+        body.get("handover_ts"))
+    return json_response(preview)
+
+
+@router.route("POST", "/api/batches/<bid>/handovers")
+def api_confirm_handover(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    body = ctx.body if isinstance(ctx.body, dict) else {}
+    record = service.confirm_handover(
+        ctx.conn, bid, body.get("prev_node_id"), body.get("next_node_id"),
+        body.get("handover_ts"), body.get("version"), body.get("preview_token"),
+        body.get("note", ""), body.get("evidence_no", ""))
+    return json_response(record, 201)
+
+
+@router.route("GET", "/api/batches/<bid>/handovers")
+def api_list_handovers(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    return json_response(service.list_handovers(ctx.conn, bid))
+
+
+@router.route("GET", "/api/batches/<bid>/handovers/<hid>")
+def api_handover_detail(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    hid = _int(ctx.params["hid"], "交接记录 id")
+    return json_response(service.get_handover(ctx.conn, bid, hid))
 
 
 # ================================================================ 服务器
