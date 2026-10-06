@@ -57,6 +57,7 @@ def batch_page(ctx):
     return Response(pages.batch_detail(
         batch, service.list_nodes(ctx.conn, bid), service.list_artifacts(ctx.conn, bid),
         summary, events, gaps, risk_groups, service.list_versions(ctx.conn, bid),
+        service.list_handovers(ctx.conn, bid),
         ctx.query.get("msg"), ctx.query.get("err")))
 
 
@@ -109,6 +110,33 @@ def close_event(ctx):
     except (service.ValidationError, service.NotFoundError) as e:
         return redirect(nxt + ("&" if "?" in nxt else "?") + "err=" + quote(e.message))
     return redirect(nxt + ("&" if "?" in nxt else "?") + "msg=" + quote("事件已关闭"))
+
+
+@router.route("POST", "/batches/<bid>/handovers/preview")
+def handover_preview(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    try:
+        preview = service.preview_handover(
+            ctx.conn, bid, ctx.body.get("from_node_id"),
+            ctx.body.get("to_node_id"), ctx.body.get("handover_ts"))
+    except service.ValidationError as e:
+        return redirect(f"/batches/{bid}?err=" + quote(e.message))
+    batch = service.get_batch(ctx.conn, bid)
+    return Response(pages.handover_preview(batch, preview))
+
+
+@router.route("POST", "/batches/<bid>/handovers")
+def confirm_handover(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    try:
+        service.confirm_handover(
+            ctx.conn, bid, ctx.body.get("from_node_id"),
+            ctx.body.get("to_node_id"), ctx.body.get("handover_ts"),
+            ctx.body.get("version"), ctx.body.get("check_hash"),
+            ctx.body.get("note"), ctx.body.get("evidence_no"))
+    except (service.ValidationError, service.ConflictError) as e:
+        return redirect(f"/batches/{bid}?err=" + quote(e.message))
+    return redirect(f"/batches/{bid}?msg=" + quote("交接已确认，记录已冻结"))
 
 
 @router.route("GET", "/batches/<bid>/versions/<vno>")
@@ -280,6 +308,40 @@ def api_close_event(ctx):
     event = service.close_event(ctx.conn, eid, ctx.body.get("note"),
                                 ctx.body.get("evidence_no"))
     return json_response(event)
+
+
+@router.route("POST", "/api/batches/<bid>/handovers/preview")
+def api_handover_preview(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    body = ctx.body if isinstance(ctx.body, dict) else {}
+    preview = service.preview_handover(
+        ctx.conn, bid, body.get("from_node_id"), body.get("to_node_id"),
+        body.get("handover_ts"))
+    return json_response(preview)
+
+
+@router.route("POST", "/api/batches/<bid>/handovers")
+def api_confirm_handover(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    body = ctx.body if isinstance(ctx.body, dict) else {}
+    record = service.confirm_handover(
+        ctx.conn, bid, body.get("from_node_id"), body.get("to_node_id"),
+        body.get("handover_ts"), body.get("version"), body.get("check_hash"),
+        body.get("note", ""), body.get("evidence_no", ""))
+    return json_response(record, 201)
+
+
+@router.route("GET", "/api/batches/<bid>/handovers")
+def api_list_handovers(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    return json_response(service.list_handovers(ctx.conn, bid))
+
+
+@router.route("GET", "/api/batches/<bid>/handovers/<hid>")
+def api_handover_detail(ctx):
+    bid = _int(ctx.params["bid"], "批次 id")
+    hid = _int(ctx.params["hid"], "交接记录 id")
+    return json_response(service.get_handover(ctx.conn, bid, hid))
 
 
 # ================================================================ 服务器

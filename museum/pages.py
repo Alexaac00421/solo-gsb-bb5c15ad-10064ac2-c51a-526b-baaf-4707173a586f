@@ -200,8 +200,93 @@ def _risk_groups_card(groups, title, hint=None):
 </div>"""
 
 
+def _result_badge(result):
+    if result == "pass":
+        return '<span class="badge closed">通过</span>'
+    return '<span class="badge open">待核</span>'
+
+
+def _fmt_reading_cell(r):
+    if not r:
+        return '<span class="muted">无</span>'
+    return (f"{escape(r['node_name'])} @ {_fmt_ts(r['ts'])}<br>"
+            f"<span class='muted'>{_fmt_num(r['temperature'])} ℃ / "
+            f"{_fmt_num(r['humidity'])} %RH</span>")
+
+
+def _handover_item_rows(items):
+    rows = ""
+    for it in items:
+        reasons = "<br>".join(escape(r) for r in it["reasons"]) or '<span class="muted">—</span>'
+        refs = ""
+        for g in it["gaps"]:
+            refs += f"<span class='badge gap'>缺测 {_fmt_ts(g['start_ts'])} 至 {_fmt_ts(g['end_ts'])}</span> "
+        for e in it["events"]:
+            refs += (f"<span class='badge open'>事件 #{e['id']} {escape(e['metric_label'])} "
+                     f"{_fmt_ts(e['start_ts'])} 至 {_fmt_ts(e['end_ts'])}</span> ")
+        rows += f"""<tr>
+<td>{escape(it['artifact_name'])}</td>
+<td>{_result_badge(it['result'])}</td>
+<td>{reasons}</td>
+<td>{_fmt_reading_cell(it['prev_reading'])}</td>
+<td>{_fmt_reading_cell(it['next_reading'])}</td>
+<td>{refs or '<span class="muted">—</span>'}</td>
+</tr>"""
+    return rows or '<tr><td colspan="6" class="muted">批次内无文物。</td></tr>'
+
+
+def _handover_items_table(items):
+    return f"""<table>
+    <tr><th>文物</th><th>结论</th><th>原因</th><th>前节点末条读数</th>
+        <th>后节点首条读数</th><th>关联缺测 / 事件</th></tr>
+    {_handover_item_rows(items)}
+  </table>"""
+
+
+def _handover_card(batch_id, nodes, handovers):
+    node_options = "".join(
+        f'<option value="{n["id"]}">#{n["seq"]} {escape(n["name"])}</option>'
+        for n in nodes)
+    if not handovers:
+        record_rows = '<tr><td colspan="7" class="muted">暂无交接记录。</td></tr>'
+    else:
+        record_rows = ""
+        for h in handovers:
+            disposition = (f"处置：{escape(h['note'])}<br>证据：{escape(h['evidence_no'])}"
+                           if h["note"] or h["evidence_no"] else
+                           '<span class="muted">—</span>')
+            record_rows += f"""<tr>
+<td>{_fmt_ts(h['created_at'])}</td>
+<td>{escape(h['from_node']['name'])} → {escape(h['to_node']['name'])}</td>
+<td>{_fmt_ts(h['handover_ts'])}</td>
+<td><span class="badge ver">v{h['version']}</span></td>
+<td>{_result_badge(h['result'])}<br><span class="muted">待核 {h['review_count']} 件</span></td>
+<td>{disposition}</td>
+<td><details><summary>逐件结论（{len(h['items'])} 件，冻结快照）</summary>
+{_handover_items_table(h['items'])}</details></td>
+</tr>"""
+    return f"""<div class="card">
+  <h2>运输节点交接</h2>
+  <form method="post" action="/batches/{batch_id}/handovers/preview">
+    <label>前节点 <select name="from_node_id">{node_options}</select></label>
+    <label>后节点 <select name="to_node_id">{node_options}</select></label>
+    <label>交接时刻 <input type="datetime-local" name="handover_ts" step="1" required></label>
+    <button type="submit">预览交接结论</button>
+  </form>
+  <p class="muted">按当前评估版本逐件核验：前后节点须相邻；前节点末条读数与后节点首条读数
+  均须存在且距交接时刻不超过该文物采样间隔，两读数间不得跨缺测区间；
+  交接时刻处于未关闭风险事件起止区间内判为待核。确认记录冻结当时版本与结论，不再改写。</p>
+  <h3>交接记录</h3>
+  <table>
+    <tr><th>确认时间</th><th>交接</th><th>交接时刻</th><th>冻结版本</th>
+        <th>结论</th><th>处置 / 证据</th><th>逐件结论</th></tr>
+    {record_rows}
+  </table>
+</div>"""
+
+
 def batch_detail(batch, nodes, artifacts, summary, events, gaps, risk_groups, versions,
-                 msg=None, err=None):
+                 handovers=None, msg=None, err=None):
     node_rows = "".join(
         f"<tr><td>{n['seq']}</td><td>{escape(n['name'])}</td><td>{escape(n['location'])}</td></tr>"
         for n in nodes
@@ -317,8 +402,47 @@ def batch_detail(batch, nodes, artifacts, summary, events, gaps, risk_groups, ve
 <div class="card">
   <h2>评估版本</h2>
   <table><tr><th>版本</th><th>生成时间</th><th>备注</th><th>操作</th></tr>{ver_rows}</table>
-</div>"""
+</div>
+
+{_handover_card(batch['id'], nodes, handovers or [])}"""
     return page(f"批次 {batch['name']}", body)
+
+
+# ---------------------------------------------------------------- 节点交接预览
+
+def handover_preview(batch, preview):
+    """交接预览页：逐件结论 + 确认表单（回传预览版本与核验指纹）。"""
+    review_note = ""
+    if preview["result"] == "review":
+        review_note = (f'<div class="alert err">存在 {preview["review_count"]} 件待核文物，'
+                       "确认交接必须填写处置说明及证据编号。</div>")
+    body = f"""
+<p><a href="/batches/{batch['id']}">← 返回批次</a></p>
+<div class="card">
+  <h2>交接预览：{escape(preview['from_node']['name'])} → {escape(preview['to_node']['name'])}</h2>
+  <p>批次「{escape(batch['name'])}」 · 交接时刻 {_fmt_ts(preview['handover_ts'])}
+     · 基于评估版本 <span class="badge ver">v{preview['version']}</span>
+     · 整体结论 {_result_badge(preview['result'])}</p>
+  <p class="muted">{escape(preview['rule'])}</p>
+  {_handover_items_table(preview['items'])}
+</div>
+<div class="card">
+  <h2>确认交接</h2>
+  {review_note}
+  <form method="post" action="/batches/{batch['id']}/handovers">
+    <input type="hidden" name="from_node_id" value="{preview['from_node']['id']}">
+    <input type="hidden" name="to_node_id" value="{preview['to_node']['id']}">
+    <input type="hidden" name="handover_ts" value="{escape(preview['handover_ts'])}">
+    <input type="hidden" name="version" value="{preview['version']}">
+    <input type="hidden" name="check_hash" value="{preview['check_hash']}">
+    <input name="note" placeholder="处置说明（有待核项必填）" size="30">
+    <input name="evidence_no" placeholder="证据编号（有待核项必填）" size="20">
+    <button type="submit">确认交接并冻结记录</button>
+  </form>
+  <p class="muted">确认时将重新核验：若当前评估版本或核验结果已变化（如补录/更正读数、
+  关闭事件），将拒绝并要求重新预览。确认记录冻结 v{preview['version']} 的逐件结论，不再改写。</p>
+</div>"""
+    return page("交接预览", body)
 
 
 # ---------------------------------------------------------------- 版本快照

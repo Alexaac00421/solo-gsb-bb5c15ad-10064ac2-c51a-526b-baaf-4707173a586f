@@ -27,6 +27,10 @@ Docker 镜像无需安装任何包即可构建运行。
   已前进时逐键比对基准版与当前版，全部一致才合并为一个新版本，冲突则整包不写入
   并返回冲突键及两版值；**同编号包重试幂等**（相同内容返回首次结果，不同内容拒绝），
   并发上传同样遵守。
+- **运输节点交接**：输入相邻的前后节点与交接时刻，按当前评估版本**预览**每件文物的
+  交接结论（通过/待核 + 原因 + 对应读数或事件）；确认时提交预览版本与核验指纹，
+  版本或核验结果已变化则拒绝并要求重核，有待核项须填写处置说明与证据编号；
+  确认记录**冻结**当时版本与逐件结论，后续补录、更正、关闭事件均不改写。
 - **输入校验**：重复时间戳、无序上下限（下限 > 上限）、非数值读数一律拒绝保存，
   并返回中文原因。
 - **页面**：首页与批次页展示批次风险摘要（开放/已关闭事件、按指标统计、缺测区间数、
@@ -67,7 +71,7 @@ python3 app.py
 
 - 页面入口：<http://localhost:8000/>
   - `/` 批次列表与风险摘要
-  - `/batches/<id>` 批次详情（摘要、节点、文物、读数录入、事件处置、缺测区间、跨文物共因风险组、版本）
+  - `/batches/<id>` 批次详情（摘要、节点、文物、读数录入、事件处置、缺测区间、跨文物共因风险组、版本、节点交接与交接记录）
   - `/batches/<id>/versions/<n>` 历史版本只读快照（含该版风险组）
   - `/batches/<id>/diff?from=<a>&to=<b>` 版本差异
 - API 前缀：`http://localhost:8000/api`
@@ -85,6 +89,7 @@ python3 app.py
 | `events`    | 风险事件：指标、起止时间、读数个数、实测范围、限值、涉及节点、最大偏离、状态与关闭结论 |
 | `gaps`      | 缺测区间：起止时间、约定间隔、实际间隔                                |
 | `packages`  | 已接收的离线采集包：包编号（批次内唯一）、基准版本、内容指纹、生成的版本号与首次结果 |
+| `handovers` | 交接确认记录：前后节点、交接时刻、冻结的评估版本与逐件结论快照、处置说明与证据编号 |
 
 ## 业务规则
 
@@ -117,6 +122,18 @@ python3 app.py
      （不产生新版本）；同编号内容不同拒绝（409）；并发上传遵守同一约束；
    - 无效基准版本、跨批次文物/节点、非法读数均明确报错（400），
      不产生版本也不占用包编号。
+8. **运输节点交接**（详见下文「运输节点交接」）：
+   - 前后节点须属于该批次且按节点顺序**前后相邻**；交接时刻须为有效时间；
+     批次尚无评估版本时不得预览或确认（均返回 400，不产生记录）；
+   - 逐件核验：前节点在交接时刻前的末条读数、后节点在交接时刻后的首条读数
+     均须存在，且各自距交接时刻不超过该文物约定采样间隔；两读数间不得跨
+     该版本的缺测区间；交接时刻处于**未关闭**风险事件起止区间（闭区间）内
+     判为待核；
+   - 确认须提交预览时返回的 `version` 与 `check_hash`：当前版本已前进或
+     核验结果已变化（如事件被关闭）则拒绝（409）并要求重新预览；
+     存在待核文物时处置说明与证据编号均必填；
+   - 确认记录冻结当时的评估版本号与逐件结论快照，后续补录、更正读数、
+     关闭事件均不改写。
 
 ## HTTP API
 
@@ -141,6 +158,10 @@ python3 app.py
 | GET  | `/api/batches/<id>/risk-groups?version=<n>` | 跨文物共因风险组（默认当前版本；批次无版本时 groups 为空） |
 | GET  | `/api/batches/<id>/versions/<n>/risk-groups` | 指定历史版本的共因风险组 |
 | POST | `/api/events/<id>/close` | 关闭事件（须处置说明 + 证据编号） |
+| POST | `/api/batches/<id>/handovers/preview` | 预览节点交接结论（按当前版本逐件核验，不落库） |
+| POST | `/api/batches/<id>/handovers` | 确认交接（提交预览版本 + 核验指纹，冻结记录） |
+| GET  | `/api/batches/<id>/handovers` | 交接记录列表（冻结快照，新的在前） |
+| GET  | `/api/batches/<id>/handovers/<hid>` | 单条交接记录（含冻结的逐件结论） |
 
 ### 调用示例
 
@@ -355,6 +376,104 @@ curl -s -X POST $BASE/api/batches/1/packages -H 'Content-Type: application/json'
 响应（首次合并成功，`201`）在在线提交响应的基础上增加
 `package_id`、`base_version`、`deduplicated` 字段；`GET /api/batches/<id>/packages`
 返回已接收包的 `package_id`、`base_version`、`note`、生成的 `version_no` 与接收时间。
+
+### 运输节点交接（本轮新增）
+
+运输节点交接分**预览**与**确认**两步：先按当前评估版本预览每件文物的交接结论，
+确认时提交预览返回的版本号与核验指纹，系统重新核验一致才生成**冻结**记录。
+
+**预览**：`POST /api/batches/<id>/handovers/preview`（不落库）
+
+```json
+{"from_node_id": 1, "to_node_id": 2, "handover_ts": "2026-10-01T08:15:00Z"}
+```
+
+逐件核验规则（任一不满足即为**待核**，`result: "review"`，全部通过为 `"pass"`）：
+
+1. 前节点在交接时刻前的末条读数、后节点在交接时刻后的首条读数均须**存在**；
+2. 两条读数各自距交接时刻**不超过该文物约定采样间隔**；
+3. 两读数间不得**跨该版本的缺测区间**；
+4. 交接时刻处于**未关闭**风险事件起止区间（闭区间）内 → 待核。
+
+预览响应含 `version`（当前评估版本）、`check_hash`（核验结果指纹）、
+整体 `result` / `review_count` 与逐件 `items`（结论、原因、对应的前/后读数、
+关联缺测区间与未关闭事件）：
+
+```json
+{
+  "batch_id": 1, "version": 2, "check_hash": "d3b2f72b…",
+  "from_node": {"id": 1, "seq": 1, "name": "库房", "location": ""},
+  "to_node": {"id": 2, "seq": 2, "name": "运输车", "location": ""},
+  "handover_ts": "2026-10-01T08:15:00+00:00",
+  "result": "review", "review_count": 1,
+  "items": [
+    {"artifact_id": 1, "artifact_name": "青花瓷瓶", "sample_interval": 600,
+     "result": "pass", "reasons": [],
+     "prev_reading": {"node_id": 1, "node_name": "库房",
+                      "ts": "2026-10-01T08:10:00+00:00", "temperature": 20.0, "humidity": 50.0},
+     "next_reading": {"node_id": 2, "node_name": "运输车",
+                      "ts": "2026-10-01T08:20:00+00:00", "temperature": 21.0, "humidity": 50.0},
+     "gaps": [], "events": []},
+    {"artifact_id": 2, "artifact_name": "绢画", "sample_interval": 600,
+     "result": "review",
+     "reasons": ["交接时刻处于未关闭风险事件 #3（温度，…）起止区间内"],
+     "prev_reading": {"…": "…"}, "next_reading": {"…": "…"},
+     "gaps": [], "events": [{"id": 3, "metric": "temperature", "metric_label": "温度",
+                             "start_ts": "…", "end_ts": "…", "status": "open"}]}
+  ]
+}
+```
+
+**确认**：`POST /api/batches/<id>/handovers`，提交预览返回的 `version` 与
+`check_hash`（`handover_ts`、前后节点须与预览一致）：
+
+```json
+{
+  "from_node_id": 1, "to_node_id": 2,
+  "handover_ts": "2026-10-01T08:15:00Z",
+  "version": 2, "check_hash": "d3b2f72b…",
+  "note": "绢画温度事件已现场处置并复查", "evidence_no": "EV-HO-0001"
+}
+```
+
+- 确认时重新核验：**当前版本已前进**或**核验结果已变化**（如事件被关闭，
+  版本号不变但结论改变）→ `409` 与中文原因，要求重新预览；
+- 存在待核文物时 `note`（处置说明）与 `evidence_no`（证据编号）**均必填**（400）；
+- 全部通过时说明与证据可留空；成功返回 `201` 与交接记录；
+- 确认记录**冻结**当时的评估版本号与逐件结论快照：后续补录、更正读数、
+  关闭事件均不改写；`GET /api/batches/<id>/handovers`（列表）与
+  `GET /api/batches/<id>/handovers/<hid>`（单条）返回的始终是冻结内容；
+- 无评估版本、非相邻前后节点（须按节点顺序前后相邻且前节点在前）、
+  无效交接时刻均返回 `400`，不产生任何记录；批次不存在返回 `404`。
+
+**调用示例**：
+
+```bash
+BASE=http://localhost:8000
+
+# 1. 预览：库房(1) → 运输车(2)，交接时刻 08:15
+curl -s -X POST $BASE/api/batches/1/handovers/preview -H 'Content-Type: application/json' \
+  -d '{"from_node_id":1,"to_node_id":2,"handover_ts":"2026-10-01T08:15:00Z"}'
+# → 记下返回的 version 与 check_hash
+
+# 2. 确认（全部通过，无需处置说明）
+curl -s -X POST $BASE/api/batches/1/handovers -H 'Content-Type: application/json' \
+  -d '{"from_node_id":1,"to_node_id":2,"handover_ts":"2026-10-01T08:15:00Z",
+       "version":2,"check_hash":"<预览返回的 check_hash>"}'
+
+# 3. 若预览存在待核项，确认须附处置说明与证据编号
+curl -s -X POST $BASE/api/batches/1/handovers -H 'Content-Type: application/json' \
+  -d '{"from_node_id":1,"to_node_id":2,"handover_ts":"2026-10-01T08:15:00Z",
+       "version":2,"check_hash":"<预览返回的 check_hash>",
+       "note":"绢画温度事件已现场处置并复查","evidence_no":"EV-HO-0001"}'
+
+# 4. 查看交接记录（冻结快照，不随版本推进或事件关闭改变）
+curl -s $BASE/api/batches/1/handovers
+curl -s $BASE/api/batches/1/handovers/1
+```
+
+批次详情页提供「运输节点交接」卡片：选择前后节点与交接时刻即可页面内预览并确认，
+下方表格展示全部交接记录（含冻结的逐件结论）。
 
 ## 运行测试
 

@@ -818,5 +818,337 @@ class PackageApiTest(unittest.TestCase):
         self.assertEqual(self._version_count(bid), 2)
 
 
+class HandoverApiTest(unittest.TestCase):
+    """运输节点交接：预览核验（通过/待核+原因）、确认冻结、版本/结果变化拒绝。"""
+
+    @classmethod
+    def setUpClass(cls):
+        import app
+        cls.tmp = tempfile.TemporaryDirectory()
+        db_path = os.path.join(cls.tmp.name, "test-ho.db")
+        cls.server = app.make_server("127.0.0.1", 0, db_path)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.tmp.cleanup()
+
+    def req(self, method, path, payload=None):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        data = json.dumps(payload).encode() if payload is not None else None
+        request = urllib.request.Request(url, data=data, method=method)
+        if data:
+            request.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(request, timeout=15) as resp:
+                return resp.status, json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode())
+
+    def _setup_batch(self, artifact_count=2):
+        """批次 + 节点(库房/运输车/展厅) + 文物（采样间隔 600 秒）。"""
+        st, batch = self.req("POST", "/api/batches", {"name": "交接测试批次"})
+        self.assertEqual(st, 201)
+        bid = batch["id"]
+        for seq, name in [(1, "库房"), (2, "运输车"), (3, "展厅")]:
+            st, _ = self.req("POST", f"/api/batches/{bid}/nodes",
+                             {"seq": seq, "name": name})
+            self.assertEqual(st, 201)
+        aids = []
+        for i in range(artifact_count):
+            st, art = self.req("POST", f"/api/batches/{bid}/artifacts",
+                               {"name": f"文物{i + 1}", "temp_min": 18, "temp_max": 24,
+                                "hum_min": 45, "hum_max": 60, "sample_interval": 600})
+            self.assertEqual(st, 201)
+            aids.append(art["id"])
+        _, det = self.req("GET", f"/api/batches/{bid}")
+        n1, n2, n3 = [n["id"] for n in det["nodes"]]
+        return bid, aids, n1, n2, n3
+
+    @staticmethod
+    def _r(aid, node, ts, t=20, h=50):
+        return {"artifact_id": aid, "node_id": node, "ts": ts,
+                "temperature": t, "humidity": h}
+
+    def _normal_v1(self, bid, aids, n1, n2):
+        """v1：文物1 库房→运输车读数齐全；文物2 同样齐全（均正常值）。"""
+        readings = [
+            self._r(aids[0], n1, "2026-10-01T08:00:00Z"),
+            self._r(aids[0], n1, "2026-10-01T08:10:00Z"),
+            self._r(aids[0], n2, "2026-10-01T08:20:00Z"),
+            self._r(aids[0], n2, "2026-10-01T08:30:00Z"),
+        ]
+        if len(aids) > 1:
+            readings += [
+                self._r(aids[1], n1, "2026-10-01T08:00:00Z"),
+                self._r(aids[1], n1, "2026-10-01T08:10:00Z"),
+                self._r(aids[1], n2, "2026-10-01T08:20:00Z"),
+            ]
+        st, res = self.req("POST", f"/api/batches/{bid}/readings",
+                           {"readings": readings, "note": "v1"})
+        self.assertEqual(st, 201)
+        return res["version"]
+
+    def _preview(self, bid, from_id, to_id, ts):
+        return self.req("POST", f"/api/batches/{bid}/handovers/preview",
+                        {"from_node_id": from_id, "to_node_id": to_id,
+                         "handover_ts": ts})
+
+    def test_preview_pass_and_confirm_freezes(self):
+        bid, aids, n1, n2, n3 = self._setup_batch()
+        self._normal_v1(bid, aids, n1, n2)
+
+        # 预览：交接时刻 08:15，两文物前节点末条 08:10 / 后节点首条 08:20，均 300 秒
+        st, pv = self._preview(bid, n1, n2, "2026-10-01T08:15:00Z")
+        self.assertEqual(st, 200)
+        self.assertEqual(pv["version"], 1)
+        self.assertEqual(pv["result"], "pass")
+        self.assertEqual(pv["review_count"], 0)
+        self.assertTrue(pv["check_hash"])
+        self.assertEqual(pv["from_node"]["name"], "库房")
+        self.assertEqual(pv["to_node"]["name"], "运输车")
+        self.assertEqual(len(pv["items"]), 2)
+        item = pv["items"][0]
+        self.assertEqual(item["result"], "pass")
+        self.assertEqual(item["reasons"], [])
+        self.assertEqual(item["prev_reading"]["ts"], "2026-10-01T08:10:00+00:00")
+        self.assertEqual(item["next_reading"]["ts"], "2026-10-01T08:20:00+00:00")
+
+        # 全部通过：无需处置说明即可确认
+        st, rec = self.req("POST", f"/api/batches/{bid}/handovers", {
+            "from_node_id": n1, "to_node_id": n2,
+            "handover_ts": "2026-10-01T08:15:00Z",
+            "version": pv["version"], "check_hash": pv["check_hash"],
+        })
+        self.assertEqual(st, 201)
+        self.assertEqual(rec["result"], "pass")
+        self.assertEqual(rec["version"], 1)
+        self.assertEqual(len(rec["items"]), 2)
+
+        # 后续补录（生成 v2 并产生新事件）、关闭事件：记录均不改写
+        st, res2 = self.req("POST", f"/api/batches/{bid}/readings", {"readings": [
+            self._r(aids[0], n3, "2026-10-01T09:00:00Z", 30)]})
+        self.assertEqual(st, 201)
+        self.assertEqual(res2["version"], 2)
+        ev = [e for e in res2["events"] if e["status"] == "open"][0]
+        st, _ = self.req("POST", f"/api/events/{ev['id']}/close",
+                         {"note": "已处置", "evidence_no": "EV-1"})
+        self.assertEqual(st, 200)
+
+        st, records = self.req("GET", f"/api/batches/{bid}/handovers")
+        self.assertEqual(st, 200)
+        self.assertEqual(len(records), 1)
+        frozen = records[0]
+        self.assertEqual(frozen["version"], 1)  # 冻结在 v1
+        self.assertEqual(frozen["result"], "pass")
+        self.assertEqual(frozen["items"], rec["items"])
+        st, one = self.req("GET", f"/api/batches/{bid}/handovers/{rec['id']}")
+        self.assertEqual(st, 200)
+        self.assertEqual(one["items"], rec["items"])
+
+        # 旧预览（v1）再确认：当前版本已前进 → 409 要求重核
+        st, err = self.req("POST", f"/api/batches/{bid}/handovers", {
+            "from_node_id": n1, "to_node_id": n2,
+            "handover_ts": "2026-10-01T08:15:00Z",
+            "version": 1, "check_hash": pv["check_hash"],
+        })
+        self.assertEqual(st, 409)
+        self.assertIn("评估版本已变化", err["error"])
+        self.assertEqual(err["current_version"], 2)
+
+    def test_preview_review_reasons(self):
+        bid, aids, n1, n2, n3 = self._setup_batch()
+        self._normal_v1(bid, aids, n1, n2)
+
+        # 后节点在交接时刻后无读数（展厅无任何读数）
+        st, pv = self._preview(bid, n2, n3, "2026-10-01T08:25:00Z")
+        self.assertEqual(st, 200)
+        self.assertEqual(pv["result"], "review")
+        self.assertEqual(pv["review_count"], 2)
+        for item in pv["items"]:
+            self.assertEqual(item["result"], "review")
+            self.assertIsNone(item["next_reading"])
+            self.assertTrue(any("后节点" in r and "无读数" in r
+                                for r in item["reasons"]))
+
+        # 前节点末条读数距交接时刻超过采样间隔（08:10 → 08:25 为 900 秒 > 600）
+        st, pv2 = self._preview(bid, n1, n2, "2026-10-01T08:25:00Z")
+        item = pv2["items"][0]
+        self.assertEqual(item["result"], "review")
+        self.assertTrue(any("超过约定采样间隔" in r for r in item["reasons"]))
+
+        # 有待核项：确认必须填写处置说明与证据编号
+        st, err = self.req("POST", f"/api/batches/{bid}/handovers", {
+            "from_node_id": n2, "to_node_id": n3,
+            "handover_ts": "2026-10-01T08:25:00Z",
+            "version": pv["version"], "check_hash": pv["check_hash"],
+        })
+        self.assertEqual(st, 400)
+        self.assertIn("处置说明及证据编号", err["error"])
+        st, rec = self.req("POST", f"/api/batches/{bid}/handovers", {
+            "from_node_id": n2, "to_node_id": n3,
+            "handover_ts": "2026-10-01T08:25:00Z",
+            "version": pv["version"], "check_hash": pv["check_hash"],
+            "note": "展厅设备未回传，已现场手工记录并补录计划",
+            "evidence_no": "EV-HO-0001",
+        })
+        self.assertEqual(st, 201)
+        self.assertEqual(rec["result"], "review")
+        self.assertEqual(rec["review_count"], 2)
+        self.assertEqual(rec["note"], "展厅设备未回传，已现场手工记录并补录计划")
+        self.assertEqual(rec["evidence_no"], "EV-HO-0001")
+
+    def test_preview_gap_crossing(self):
+        bid, aids, n1, n2, n3 = self._setup_batch(artifact_count=1)
+        aid = aids[0]
+        # 08:10 → 08:30 间隔 1200 秒 > 600 → 缺测区间
+        st, res = self.req("POST", f"/api/batches/{bid}/readings", {"readings": [
+            self._r(aid, n1, "2026-10-01T08:10:00Z"),
+            self._r(aid, n2, "2026-10-01T08:30:00Z"),
+        ]})
+        self.assertEqual(st, 201)
+        self.assertEqual(len(res["gaps"]), 1)
+
+        # 交接 08:20：两读数各距 600 秒（不超），但两读数间跨缺测区间
+        st, pv = self._preview(bid, n1, n2, "2026-10-01T08:20:00Z")
+        self.assertEqual(st, 200)
+        item = pv["items"][0]
+        self.assertEqual(item["result"], "review")
+        self.assertTrue(any("跨越缺测区间" in r for r in item["reasons"]))
+        self.assertEqual(len(item["gaps"]), 1)
+        self.assertEqual(item["gaps"][0]["start_ts"], "2026-10-01T08:10:00+00:00")
+
+    def test_open_event_review_and_hash_change_on_close(self):
+        bid, aids, n1, n2, n3 = self._setup_batch(artifact_count=1)
+        aid = aids[0]
+        # 温度 08:00/08:10 越界 → 开放事件 [08:00, 08:10]
+        st, res = self.req("POST", f"/api/batches/{bid}/readings", {"readings": [
+            self._r(aid, n1, "2026-10-01T08:00:00Z", 26),
+            self._r(aid, n1, "2026-10-01T08:10:00Z", 26),
+            self._r(aid, n2, "2026-10-01T08:15:00Z", 20),
+            self._r(aid, n2, "2026-10-01T08:25:00Z", 20),
+        ]})
+        self.assertEqual(st, 201)
+        ev = [e for e in res["events"] if e["metric"] == "temperature"][0]
+
+        # 交接时刻 08:10 处于未关闭事件起止区间内 → 待核
+        st, pv = self._preview(bid, n1, n2, "2026-10-01T08:10:00Z")
+        self.assertEqual(st, 200)
+        item = pv["items"][0]
+        self.assertEqual(item["result"], "review")
+        self.assertTrue(any("未关闭风险事件" in r for r in item["reasons"]))
+        self.assertEqual([e["id"] for e in item["events"]], [ev["id"]])
+
+        # 关闭事件（版本号不变）→ 核验结果变化：旧指纹确认被拒（409）
+        st, _ = self.req("POST", f"/api/events/{ev['id']}/close",
+                         {"note": "已处置", "evidence_no": "EV-2"})
+        self.assertEqual(st, 200)
+        st, err = self.req("POST", f"/api/batches/{bid}/handovers", {
+            "from_node_id": n1, "to_node_id": n2,
+            "handover_ts": "2026-10-01T08:10:00Z",
+            "version": pv["version"], "check_hash": pv["check_hash"],
+        })
+        self.assertEqual(st, 409)
+        self.assertIn("核验结果已变化", err["error"])
+
+        # 重新预览：事件已关闭 → 通过；确认成功且无需处置说明
+        st, pv2 = self._preview(bid, n1, n2, "2026-10-01T08:10:00Z")
+        self.assertEqual(pv2["result"], "pass")
+        self.assertNotEqual(pv2["check_hash"], pv["check_hash"])
+        st, rec = self.req("POST", f"/api/batches/{bid}/handovers", {
+            "from_node_id": n1, "to_node_id": n2,
+            "handover_ts": "2026-10-01T08:10:00Z",
+            "version": pv2["version"], "check_hash": pv2["check_hash"],
+        })
+        self.assertEqual(st, 201)
+        self.assertEqual(rec["result"], "pass")
+
+    def test_invalid_inputs_no_record(self):
+        bid, aids, n1, n2, n3 = self._setup_batch()
+        # 无评估版本：预览与确认均拒绝，不产生记录
+        st, err = self._preview(bid, n1, n2, "2026-10-01T08:15:00Z")
+        self.assertEqual(st, 400)
+        self.assertIn("尚无评估版本", err["error"])
+        st, err = self.req("POST", f"/api/batches/{bid}/handovers", {
+            "from_node_id": n1, "to_node_id": n2,
+            "handover_ts": "2026-10-01T08:15:00Z", "version": 1, "check_hash": "x",
+        })
+        self.assertEqual(st, 400)
+        self.assertIn("尚无评估版本", err["error"])
+
+        self._normal_v1(bid, aids, n1, n2)
+        # 非相邻节点（跨序 / 反向 / 相同）
+        for from_id, to_id in [(n1, n3), (n2, n1), (n1, n1)]:
+            st, err = self._preview(bid, from_id, to_id, "2026-10-01T08:15:00Z")
+            self.assertEqual(st, 400, (from_id, to_id))
+        st, err = self._preview(bid, n1, n3, "2026-10-01T08:15:00Z")
+        self.assertIn("不是相邻的前后节点", err["error"])
+        # 无效交接时刻
+        st, err = self._preview(bid, n1, n2, "不是时间")
+        self.assertEqual(st, 400)
+        self.assertIn("交接时刻格式无效", err["error"])
+        # 确认缺核验指纹 / 版本号无效
+        st, err = self.req("POST", f"/api/batches/{bid}/handovers", {
+            "from_node_id": n1, "to_node_id": n2,
+            "handover_ts": "2026-10-01T08:15:00Z", "version": 1,
+        })
+        self.assertEqual(st, 400)
+        self.assertIn("check_hash", err["error"])
+        st, err = self.req("POST", f"/api/batches/{bid}/handovers", {
+            "from_node_id": n1, "to_node_id": n2,
+            "handover_ts": "2026-10-01T08:15:00Z", "version": "abc",
+            "check_hash": "x",
+        })
+        self.assertEqual(st, 400)
+        self.assertIn("预览版本号无效", err["error"])
+        # 批次不存在 → 404
+        st, err = self._preview(9999, n1, n2, "2026-10-01T08:15:00Z")
+        self.assertEqual(st, 404)
+        st, err = self.req("GET", "/api/batches/9999/handovers")
+        self.assertEqual(st, 404)
+
+        # 以上全部不产生交接记录
+        st, records = self.req("GET", f"/api/batches/{bid}/handovers")
+        self.assertEqual(st, 200)
+        self.assertEqual(records, [])
+
+    def test_pages(self):
+        bid, aids, n1, n2, n3 = self._setup_batch()
+        self._normal_v1(bid, aids, n1, n2)
+        st, pv = self._preview(bid, n1, n2, "2026-10-01T08:15:00Z")
+        self.assertEqual(st, 200)
+        st, rec = self.req("POST", f"/api/batches/{bid}/handovers", {
+            "from_node_id": n1, "to_node_id": n2,
+            "handover_ts": "2026-10-01T08:15:00Z",
+            "version": pv["version"], "check_hash": pv["check_hash"],
+        })
+        self.assertEqual(st, 201)
+
+        # 批次页展示交接记录
+        url = f"http://127.0.0.1:{self.port}/batches/{bid}"
+        with urllib.request.urlopen(url) as resp:
+            html = resp.read().decode()
+        self.assertIn("运输节点交接", html)
+        self.assertIn("交接记录", html)
+        self.assertIn("通过", html)
+
+        # 页面表单流程：预览页 → 确认 → 重定向回批次页
+        form = urllib.parse.urlencode({
+            "from_node_id": n1, "to_node_id": n2,
+            "handover_ts": "2026-10-01T08:15",
+        }).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/batches/{bid}/handovers/preview",
+            data=form, method="POST")
+        with urllib.request.urlopen(req) as resp:
+            html = resp.read().decode()
+        self.assertIn("交接预览", html)
+        self.assertIn("确认交接", html)
+
+
 if __name__ == "__main__":
     unittest.main()

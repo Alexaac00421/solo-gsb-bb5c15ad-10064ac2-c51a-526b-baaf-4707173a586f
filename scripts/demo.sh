@@ -120,3 +120,47 @@ curl -s -X POST "$BASE/api/batches/1/packages" -H "$JSON" -d '{
 
 echo "== 16. 已成功接收的采集包列表（冲突/校验失败的包不占用编号）=="
 curl -s "$BASE/api/batches/1/packages"
+
+echo
+echo "== 17. 节点交接：预览 运输车→展厅 @ 08:27（全部通过）并确认 =="
+PREVIEW=$(curl -s -X POST "$BASE/api/batches/1/handovers/preview" -H "$JSON" \
+  -d '{"from_node_id":2,"to_node_id":3,"handover_ts":"2026-10-01T08:27:00Z"}')
+echo "$PREVIEW" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("预览: 版本v%d 整体%s 待核%d件" % (d["version"], d["result"], d["review_count"]))'
+echo "$PREVIEW" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print(json.dumps({"from_node_id":d["from_node"]["id"],"to_node_id":d["to_node"]["id"],
+  "handover_ts":d["handover_ts"],"version":d["version"],"check_hash":d["check_hash"]}))' \
+  > /tmp/ho_confirm.json
+curl -s -X POST "$BASE/api/batches/1/handovers" -H "$JSON" -d @/tmp/ho_confirm.json \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("确认: 记录#%d 冻结v%d 结论%s" % (d["id"], d["version"], d["result"]))'
+
+echo "== 18. 预览 库房→运输车 @ 08:15：绢画待核（前节点无读数 + 交接时刻处于未关闭事件内）=="
+PREVIEW2=$(curl -s -X POST "$BASE/api/batches/1/handovers/preview" -H "$JSON" \
+  -d '{"from_node_id":1,"to_node_id":2,"handover_ts":"2026-10-01T08:15:00Z"}')
+echo "$PREVIEW2" | python3 -c 'import json,sys; d=json.load(sys.stdin)
+for i in d["items"]: print(" ", i["artifact_name"], i["result"], "；".join(i["reasons"]) or "—")'
+echo "-- 有待核项：确认须附处置说明与证据编号 --"
+echo "$PREVIEW2" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print(json.dumps({"from_node_id":d["from_node"]["id"],"to_node_id":d["to_node"]["id"],
+  "handover_ts":d["handover_ts"],"version":d["version"],"check_hash":d["check_hash"],
+  "note":"绢画温度事件已现场处置并复查，库房读数缺失已手工补记",
+  "evidence_no":"EV-HO-0001"}))' > /tmp/ho_confirm2.json
+curl -s -X POST "$BASE/api/batches/1/handovers" -H "$JSON" -d @/tmp/ho_confirm2.json \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("确认: 记录#%d 冻结v%d 结论%s 待核%d件" % (d["id"], d["version"], d["result"], d["review_count"]))'
+
+echo "== 19. 补录读数生成新版本后，用旧预览确认 → 409 要求重新预览 =="
+curl -s -X POST "$BASE/api/batches/1/readings" -H "$JSON" \
+  -d '{"note":"展厅补录","readings":[{"artifact_id":1,"node_id":3,"ts":"2026-10-01T10:20:00Z","temperature":21,"humidity":50}]}' \
+  | python3 -c 'import json,sys; print("补录后当前版本: v%d" % json.load(sys.stdin)["version"])'
+curl -s -X POST "$BASE/api/batches/1/handovers" -H "$JSON" -d @/tmp/ho_confirm.json
+echo
+
+echo "== 20. 交接记录列表（冻结快照，不随版本推进或事件关闭改变）=="
+curl -s "$BASE/api/batches/1/handovers" | python3 -c 'import json,sys
+for h in json.load(sys.stdin):
+    print(" 记录#%d %s→%s @ %s 冻结v%d %s（待核%d件）" % (
+        h["id"], h["from_node"]["name"], h["to_node"]["name"],
+        h["handover_ts"], h["version"], h["result"], h["review_count"]))'

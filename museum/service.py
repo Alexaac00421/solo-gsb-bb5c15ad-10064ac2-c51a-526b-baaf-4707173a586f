@@ -716,3 +716,289 @@ def close_event(conn, event_id, note, evidence_no):
     names = _artifact_names(conn, version["batch_id"])
     updated = conn.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
     return _event_dict(updated, names)
+
+
+# ---------------------------------------------------------------- 运输节点交接
+
+HANDOVER_RULE = (
+    "前节点在交接时刻前的末条读数与后节点在交接时刻后的首条读数均须存在，"
+    "且各自距交接时刻不超过该文物约定采样间隔，两读数间不得跨该版本的缺测区间；"
+    "交接时刻处于未关闭风险事件起止区间内判为待核。"
+)
+
+
+def _node_brief(n):
+    return {"id": n["id"], "seq": n["seq"], "name": n["name"],
+            "location": n["location"]}
+
+
+def _handover_reading_brief(row, node_map):
+    return {"node_id": row["node_id"],
+            "node_name": node_map[row["node_id"]]["name"],
+            "ts": row["ts"],
+            "temperature": row["temperature"],
+            "humidity": row["humidity"]}
+
+
+def _handover_hash(preview):
+    """核验结果指纹：版本、前后节点、交接时刻与逐件结论（含原因、读数与事件）。
+
+    关闭事件不改变版本号但会改变核验结果，因此指纹覆盖结论内容本身；
+    补录/更正读数会推进版本号，由版本比对先行拦截。
+    """
+    norm = {
+        "version": preview["version"],
+        "from_node_id": preview["from_node"]["id"],
+        "to_node_id": preview["to_node"]["id"],
+        "handover_ts": preview["handover_ts"],
+        "items": [{
+            "artifact_id": it["artifact_id"],
+            "result": it["result"],
+            "reasons": it["reasons"],
+            "prev_ts": it["prev_reading"]["ts"] if it["prev_reading"] else None,
+            "next_ts": it["next_reading"]["ts"] if it["next_reading"] else None,
+            "events": [e["id"] for e in it["events"]],
+            "gaps": [[g["start_ts"], g["end_ts"]] for g in it["gaps"]],
+        } for it in preview["items"]],
+    }
+    raw = json.dumps(norm, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def preview_handover(conn, batch_id, from_node_id, to_node_id, handover_ts):
+    """按当前评估版本预览逐件文物的交接结论（不落库）。规则见 HANDOVER_RULE。
+
+    无评估版本、非相邻前后节点或无效交接时刻均拒绝（400），不产生任何记录。
+    """
+    get_batch(conn, batch_id)
+    try:
+        dt = parse_ts(handover_ts)
+    except (ValueError, TypeError):
+        raise ValidationError(f"交接时刻格式无效（需 ISO 8601）: {handover_ts!r}")
+    ts = iso(dt)
+
+    nodes = list_nodes(conn, batch_id)
+    node_map = {n["id"]: n for n in nodes}
+    try:
+        from_id = to_int(from_node_id)
+    except (ValueError, TypeError):
+        raise ValidationError(f"前节点 id 无效: {from_node_id!r}")
+    try:
+        to_id = to_int(to_node_id)
+    except (ValueError, TypeError):
+        raise ValidationError(f"后节点 id 无效: {to_node_id!r}")
+    if from_id not in node_map:
+        raise ValidationError(f"前节点 {from_id} 不属于批次 {batch_id}")
+    if to_id not in node_map:
+        raise ValidationError(f"后节点 {to_id} 不属于批次 {batch_id}")
+    if from_id == to_id:
+        raise ValidationError("前节点与后节点不能相同")
+    ordered = sorted(nodes, key=lambda n: n["seq"])
+    pos = {n["id"]: i for i, n in enumerate(ordered)}
+    if pos[to_id] - pos[from_id] != 1:
+        raise ValidationError(
+            f"节点「{node_map[from_id]['name']}」与「{node_map[to_id]['name']}」"
+            "不是相邻的前后节点（须按节点顺序前后相邻，且前节点在前）")
+
+    cur = current_version(conn, batch_id)
+    if not cur:
+        raise ValidationError(f"批次 {batch_id} 尚无评估版本，无法核验交接")
+
+    artifacts = list_artifacts(conn, batch_id)
+    names = {a["id"]: a["name"] for a in artifacts}
+    open_events = defaultdict(list)
+    for e in version_events(conn, cur["id"], names):
+        if e["status"] != "closed":
+            open_events[e["artifact_id"]].append(e)
+    gaps_by_art = defaultdict(list)
+    for g in version_gaps(conn, cur["id"], names):
+        gaps_by_art[g["artifact_id"]].append(g)
+    rows = conn.execute(
+        """SELECT * FROM readings WHERE version_id=? AND node_id IN (?,?)
+           ORDER BY artifact_id, ts""",
+        (cur["id"], from_id, to_id),
+    ).fetchall()
+    readings_by_art = defaultdict(list)
+    for r in rows:
+        readings_by_art[r["artifact_id"]].append(dict(r))
+
+    items = []
+    for a in artifacts:
+        aid = a["id"]
+        interval = a["sample_interval"]
+        rs = readings_by_art.get(aid, [])
+        # ts 均为规范化 UTC ISO 字符串，字典序即时间序
+        prev_rows = [r for r in rs if r["node_id"] == from_id and r["ts"] <= ts]
+        next_rows = [r for r in rs if r["node_id"] == to_id and r["ts"] >= ts]
+        prev = prev_rows[-1] if prev_rows else None
+        nxt = next_rows[0] if next_rows else None
+
+        reasons = []
+        if prev is None:
+            reasons.append(
+                f"前节点「{node_map[from_id]['name']}」在交接时刻前无读数")
+        else:
+            delta = (dt - parse_ts(prev["ts"])).total_seconds()
+            if delta > interval:
+                reasons.append(
+                    f"前节点末条读数（{prev['ts']}）距交接时刻 {delta:g} 秒，"
+                    f"超过约定采样间隔 {interval} 秒")
+        if nxt is None:
+            reasons.append(
+                f"后节点「{node_map[to_id]['name']}」在交接时刻后无读数")
+        else:
+            delta = (parse_ts(nxt["ts"]) - dt).total_seconds()
+            if delta > interval:
+                reasons.append(
+                    f"后节点首条读数（{nxt['ts']}）距交接时刻 {delta:g} 秒，"
+                    f"超过约定采样间隔 {interval} 秒")
+
+        crossed = []
+        if prev is not None and nxt is not None:
+            for g in gaps_by_art.get(aid, []):
+                # 缺测区间与两读数之间的开区间相交即为"跨过"
+                if g["start_ts"] < nxt["ts"] and g["end_ts"] > prev["ts"]:
+                    crossed.append(g)
+            for g in crossed:
+                reasons.append(
+                    f"前后读数之间跨越缺测区间（{g['start_ts']} 至 {g['end_ts']}）")
+
+        hit_events = [e for e in open_events.get(aid, [])
+                      if e["start_ts"] <= ts <= e["end_ts"]]
+        for e in hit_events:
+            reasons.append(
+                f"交接时刻处于未关闭风险事件 #{e['id']}（{e['metric_label']}，"
+                f"{e['start_ts']} 至 {e['end_ts']}）起止区间内")
+
+        items.append({
+            "artifact_id": aid,
+            "artifact_name": names[aid],
+            "sample_interval": interval,
+            "result": "review" if reasons else "pass",
+            "reasons": reasons,
+            "prev_reading": (_handover_reading_brief(prev, node_map)
+                             if prev else None),
+            "next_reading": (_handover_reading_brief(nxt, node_map)
+                             if nxt else None),
+            "gaps": [{"start_ts": g["start_ts"], "end_ts": g["end_ts"],
+                      "expected_interval": g["expected_interval"],
+                      "actual_interval": g["actual_interval"]}
+                     for g in crossed],
+            "events": [{"id": e["id"], "metric": e["metric"],
+                        "metric_label": e["metric_label"],
+                        "start_ts": e["start_ts"], "end_ts": e["end_ts"],
+                        "status": e["status"]} for e in hit_events],
+        })
+
+    preview = {
+        "batch_id": batch_id,
+        "version": cur["version_no"],
+        "from_node": _node_brief(node_map[from_id]),
+        "to_node": _node_brief(node_map[to_id]),
+        "handover_ts": ts,
+        "result": "review" if any(i["result"] == "review" for i in items) else "pass",
+        "review_count": sum(1 for i in items if i["result"] == "review"),
+        "rule": HANDOVER_RULE,
+        "items": items,
+    }
+    preview["check_hash"] = _handover_hash(preview)
+    return preview
+
+
+def confirm_handover(conn, batch_id, from_node_id, to_node_id, handover_ts,
+                     version, check_hash, note="", evidence_no=""):
+    """确认交接：提交预览时的版本号与核验指纹，一致才生成记录。
+
+    - 当前版本或核验结果已变化（如补录/更正读数、关闭事件）→ 409，要求重新预览；
+    - 存在待核文物时，处置说明与证据编号均必填；
+    - 确认记录冻结当时的评估版本与逐件结论快照，后续补录、更正、
+      关闭事件均不改写。
+    """
+    get_batch(conn, batch_id)
+    try:
+        version = to_int(version)
+    except (ValueError, TypeError):
+        raise ValidationError(
+            f"预览版本号无效: {version!r}（须提交预览时返回的 version）")
+    if not (check_hash or "").strip():
+        raise ValidationError("缺少核验指纹 check_hash（须先调用预览接口获取）")
+
+    conn.execute("BEGIN IMMEDIATE")  # 串行化并发确认，版本比对与落库保持一致
+    try:
+        preview = preview_handover(conn, batch_id, from_node_id,
+                                   to_node_id, handover_ts)
+        if version != preview["version"]:
+            raise ConflictError(
+                f"评估版本已变化：预览基于 v{version}，当前为 "
+                f"v{preview['version']}，请重新预览核验后再确认",
+                {"current_version": preview["version"]})
+        if check_hash.strip() != preview["check_hash"]:
+            raise ConflictError(
+                "核验结果已变化（如风险事件关闭状态改变），请重新预览核验后再确认",
+                {"current_version": preview["version"]})
+        note = (note or "").strip()
+        evidence_no = (evidence_no or "").strip()
+        if preview["result"] == "review" and (not note or not evidence_no):
+            raise ValidationError(
+                "存在待核文物，确认交接必须填写处置说明及证据编号")
+        snapshot = {k: preview[k] for k in
+                    ("version", "from_node", "to_node", "handover_ts",
+                     "result", "review_count", "items")}
+        cur = conn.execute(
+            """INSERT INTO handovers(batch_id, from_node_id, to_node_id, handover_ts,
+               version_no, check_hash, result, review_count, note, evidence_no,
+               snapshot_json, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (batch_id, preview["from_node"]["id"], preview["to_node"]["id"],
+             preview["handover_ts"], preview["version"], preview["check_hash"],
+             preview["result"], preview["review_count"], note, evidence_no,
+             json.dumps(snapshot, ensure_ascii=False), now_iso()),
+        )
+        handover_id = cur.lastrowid
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return get_handover(conn, batch_id, handover_id)
+
+
+def _handover_dict(row):
+    """交接记录：展示字段取自冻结快照（节点名、逐件结论等保持确认时状态）。"""
+    d = dict(row)
+    snap = json.loads(d.pop("snapshot_json"))
+    return {
+        "id": d["id"],
+        "batch_id": d["batch_id"],
+        "from_node": snap["from_node"],
+        "to_node": snap["to_node"],
+        "handover_ts": snap["handover_ts"],
+        "version": d["version_no"],
+        "check_hash": d["check_hash"],
+        "result": snap["result"],
+        "review_count": snap["review_count"],
+        "note": d["note"],
+        "evidence_no": d["evidence_no"],
+        "created_at": d["created_at"],
+        "rule": HANDOVER_RULE,
+        "items": snap["items"],
+    }
+
+
+def get_handover(conn, batch_id, handover_id):
+    get_batch(conn, batch_id)
+    row = conn.execute(
+        "SELECT * FROM handovers WHERE id=? AND batch_id=?",
+        (handover_id, batch_id),
+    ).fetchone()
+    if not row:
+        raise NotFoundError(f"批次 {batch_id} 的交接记录 {handover_id} 不存在")
+    return _handover_dict(row)
+
+
+def list_handovers(conn, batch_id):
+    """批次交接记录（新的在前）；记录为冻结快照，不随版本推进或事件关闭改变。"""
+    get_batch(conn, batch_id)
+    rows = conn.execute(
+        "SELECT * FROM handovers WHERE batch_id=? ORDER BY id DESC",
+        (batch_id,),
+    ).fetchall()
+    return [_handover_dict(r) for r in rows]
